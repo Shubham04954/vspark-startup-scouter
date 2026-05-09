@@ -166,7 +166,7 @@ def get_model():
         model_name="gemini-2.5-flash",
         system_instruction=full_system,
         # google_search tool gives real-time web access
-        tools="google_search_retrieval",
+        tools="google_search",
         generation_config=genai.types.GenerationConfig(
             temperature=0.3,  # low temp for consistency
             response_mime_type="application/json",
