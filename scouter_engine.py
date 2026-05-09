@@ -6,7 +6,7 @@ populated row-dict matching the format expected by write_scouter.py and
 write_analyzed.py.
 
 Uses Gemini 2.5 Flash with the google_search grounding tool so the model
-has real-time web access. The rubric is loaded from the rubric/ folder
+has real-time web access. The rubric is loaded from the same directory
 and stitched into the system prompt at startup.
 
 Returns two dicts per startup:
@@ -23,7 +23,7 @@ from typing import Optional
 import google.generativeai as genai
 
 
-RUBRIC_DIR = Path(__file__).parent.parent / "rubric"
+RUBRIC_DIR = Path(__file__).parent
 
 
 def load_rubric_context() -> str:
@@ -165,23 +165,53 @@ def get_model():
     model = genai.GenerativeModel(
         model_name="gemini-2.5-flash",
         system_instruction=full_system,
-        # google_search tool gives real-time web access
-        tools="google_search",
+        # google_search grounding tool — must be a dict (NOT a string) in google-generativeai SDK
+        tools=[{"google_search": {}}],
         generation_config=genai.types.GenerationConfig(
             temperature=0.3,  # low temp for consistency
-            response_mime_type="application/json",
+            # NOTE: response_mime_type cannot be combined with google_search tool — Gemini rejects.
+            # We rely on parse_json_response() to robustly extract JSON from possibly-fenced output.
         ),
     )
     return model
 
 
 def parse_json_response(text: str) -> dict:
-    """Parse Gemini's response — strip code fences if any, parse JSON."""
-    # Strip ```json ... ``` fences if present
-    text = re.sub(r"```json\s*", "", text)
-    text = re.sub(r"```\s*$", "", text.strip())
+    """Parse Gemini's response — robust to markdown fences and surrounding prose.
+
+    Tries:
+    1. Direct JSON parse (cleanest case)
+    2. Strip ```json ... ``` or ``` ... ``` fences and retry
+    3. Find the largest {...} block in the text and parse it
+    """
     text = text.strip()
-    return json.loads(text)
+
+    # Try 1: direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try 2: strip markdown code fences
+    cleaned = re.sub(r"^```(?:json)?\s*", "", text)
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+    cleaned = cleaned.strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Try 3: find the outermost {...} JSON block in the text
+    # This handles cases where Gemini adds prose before/after the JSON
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    # All attempts failed — raise so caller can flag insufficient_data
+    raise json.JSONDecodeError("Could not extract valid JSON from response", text, 0)
 
 
 def scout_startup(
@@ -276,7 +306,8 @@ def extract_names_from_image(image_bytes: bytes, api_key: str) -> dict:
         }
     """
     configure_gemini(api_key)
-    # Use vision-capable model
+    # Use vision-capable model — no google_search tool needed for this, so we can
+    # safely use response_mime_type for cleaner JSON output.
     model = genai.GenerativeModel("gemini-2.5-flash")
 
     prompt = (
