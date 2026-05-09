@@ -1,26 +1,17 @@
 """
 scouter_engine.py — Gemini-powered scouting engine.
 
-Takes a startup name (or deck text, or other input) and returns a fully
-populated row-dict matching the format expected by write_scouter.py and
-write_analyzed.py.
-
-Uses Gemini 2.5 Flash with the google_search grounding tool so the model
-has real-time web access. The rubric is loaded from the same directory
-and stitched into the system prompt at startup.
-
-Returns two dicts per startup:
-  - scouter_row: the 19-column breakdown for New_Startup_Scouter sheet
-  - analyzed_row: the 7-column executive line for Analyzed Startups sheet
+Uses the google-genai SDK (NOT the older google-generativeai) with the
+google_search grounding tool for real-time web research.
 """
 
-import os
 import json
 import re
 from pathlib import Path
 from typing import Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 
 RUBRIC_DIR = Path(__file__).parent
@@ -151,40 +142,16 @@ The following sections give you the BU profiles, credibility flag patterns, rout
 """
 
 
-def configure_gemini(api_key: str):
-    """Configure Gemini client with the given API key."""
-    genai.configure(api_key=api_key)
-
-
-def get_model():
-    """Return a Gemini model configured with system prompt + grounding."""
-    rubric = load_rubric_context()
-    full_system = SYSTEM_PROMPT + rubric
-
-    # Use 2.5 Flash for cost / quota friendliness; switch to 2.5-pro if needed
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        system_instruction=full_system,
-        # google_search grounding tool — must be a dict (NOT a string) in google-generativeai SDK
-        tools=[{"google_search": {}}],
-        generation_config=genai.types.GenerationConfig(
-            temperature=0.3,  # low temp for consistency
-            # NOTE: response_mime_type cannot be combined with google_search tool — Gemini rejects.
-            # We rely on parse_json_response() to robustly extract JSON from possibly-fenced output.
-        ),
-    )
-    return model
+def get_client(api_key: str):
+    """Return a configured google-genai client."""
+    return genai.Client(api_key=api_key)
 
 
 def parse_json_response(text: str) -> dict:
-    """Parse Gemini's response — robust to markdown fences and surrounding prose.
-
-    Tries:
-    1. Direct JSON parse (cleanest case)
-    2. Strip ```json ... ``` or ``` ... ``` fences and retry
-    3. Find the largest {...} block in the text and parse it
-    """
-    text = text.strip()
+    """Parse Gemini's response — robust to markdown fences and surrounding prose."""
+    text = (text or "").strip()
+    if not text:
+        raise json.JSONDecodeError("Empty response from Gemini", "", 0)
 
     # Try 1: direct parse
     try:
@@ -201,8 +168,7 @@ def parse_json_response(text: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # Try 3: find the outermost {...} JSON block in the text
-    # This handles cases where Gemini adds prose before/after the JSON
+    # Try 3: find the outermost {...} JSON block
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         try:
@@ -210,7 +176,6 @@ def parse_json_response(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # All attempts failed — raise so caller can flag insufficient_data
     raise json.JSONDecodeError("Could not extract valid JSON from response", text, 0)
 
 
@@ -219,35 +184,45 @@ def scout_startup(
     api_key: str,
     extra_context: Optional[str] = None,
 ) -> dict:
-    """Scout a single startup. Returns the parsed JSON response.
-
-    Args:
-        name: Startup name to scout.
-        api_key: Gemini API key.
-        extra_context: Optional extra info (e.g. user-provided URL, deck text).
-
-    Returns:
-        dict with keys: insufficient_data, ambiguous, scouter_row, analyzed_row
-    """
-    configure_gemini(api_key)
-    model = get_model()
+    """Scout a single startup. Uses google-genai SDK with google_search grounding."""
+    client = get_client(api_key)
 
     user_prompt = f"Scout this startup for V-Spark: **{name}**"
     if extra_context:
         user_prompt += f"\n\nAdditional context provided by user:\n{extra_context}"
-
     user_prompt += (
         "\n\nReturn the JSON exactly as specified. No prose. No markdown fences. "
         "Just the JSON object."
     )
 
-    response = model.generate_content(user_prompt)
-    text = response.text
+    rubric = load_rubric_context()
+    full_system = SYSTEM_PROMPT + rubric
 
     try:
-        result = parse_json_response(text)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=full_system,
+                temperature=0.3,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+            ),
+        )
+    except Exception as e:
+        return {
+            "insufficient_data": True,
+            "ambiguous": False,
+            "ambiguous_candidates": [],
+            "scouter_row": None,
+            "analyzed_row": None,
+            "_error": f"Gemini API error: {str(e)[:300]}",
+        }
+
+    text = getattr(response, "text", "") or ""
+
+    try:
+        return parse_json_response(text)
     except json.JSONDecodeError as e:
-        # Save the raw response for debugging; return insufficient_data
         return {
             "insufficient_data": True,
             "ambiguous": False,
@@ -258,20 +233,10 @@ def scout_startup(
             "_error": f"JSON parse error: {e}",
         }
 
-    return result
 
-
-def scout_from_deck_text(
-    deck_text: str,
-    api_key: str,
-) -> dict:
-    """Scout a startup using extracted deck text as primary source.
-
-    The model is instructed to cross-check claims via web search but use the
-    deck as the canonical product/team description.
-    """
-    configure_gemini(api_key)
-    model = get_model()
+def scout_from_deck_text(deck_text: str, api_key: str) -> dict:
+    """Scout a startup using extracted deck text as primary source."""
+    client = get_client(api_key)
 
     user_prompt = (
         "I have a pitch deck for a startup. Use this deck text as the primary "
@@ -282,9 +247,32 @@ def scout_from_deck_text(
         "Return the JSON exactly as specified. No prose. No markdown fences."
     )
 
-    response = model.generate_content(user_prompt)
+    rubric = load_rubric_context()
+    full_system = SYSTEM_PROMPT + rubric
+
     try:
-        return parse_json_response(response.text)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=full_system,
+                temperature=0.3,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+            ),
+        )
+    except Exception as e:
+        return {
+            "insufficient_data": True,
+            "ambiguous": False,
+            "ambiguous_candidates": [],
+            "scouter_row": None,
+            "analyzed_row": None,
+            "_error": f"Gemini API error: {str(e)[:300]}",
+        }
+
+    text = getattr(response, "text", "") or ""
+    try:
+        return parse_json_response(text)
     except json.JSONDecodeError as e:
         return {
             "insufficient_data": True,
@@ -292,7 +280,7 @@ def scout_from_deck_text(
             "ambiguous_candidates": [],
             "scouter_row": None,
             "analyzed_row": None,
-            "_raw_response": response.text[:500],
+            "_raw_response": text[:500],
             "_error": f"JSON parse error: {e}",
         }
 
@@ -300,15 +288,9 @@ def scout_from_deck_text(
 def extract_names_from_image(image_bytes: bytes, api_key: str) -> dict:
     """Extract startup names from an uploaded infographic / screenshot.
 
-    Returns:
-        {
-          "names": [{"name": str, "confidence": "high|medium|low", "note": str}, ...]
-        }
+    Vision model — no google_search needed. Uses response_mime_type for clean JSON.
     """
-    configure_gemini(api_key)
-    # Use vision-capable model — no google_search tool needed for this, so we can
-    # safely use response_mime_type for cleaner JSON output.
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    client = get_client(api_key)
 
     prompt = (
         "Look at this image. It contains startup names and/or logos (e.g. an Inc42 infographic, "
@@ -321,18 +303,23 @@ def extract_names_from_image(image_bytes: bytes, api_key: str) -> dict:
         "{\"names\": [{\"name\": \"...\", \"confidence\": \"high|medium|low\", \"note\": \"...\"}]}"
     )
 
-    response = model.generate_content(
-        [
-            {"mime_type": "image/png", "data": image_bytes},
-            prompt,
-        ],
-        generation_config=genai.types.GenerationConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
-    )
-
     try:
-        return parse_json_response(response.text)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+                prompt,
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                response_mime_type="application/json",
+            ),
+        )
+    except Exception as e:
+        return {"names": [], "_error": f"Gemini vision error: {str(e)[:300]}"}
+
+    text = getattr(response, "text", "") or ""
+    try:
+        return parse_json_response(text)
     except json.JSONDecodeError:
-        return {"names": [], "_error": "Could not parse vision response"}
+        return {"names": [], "_error": "Could not parse vision response", "_raw": text[:300]}
