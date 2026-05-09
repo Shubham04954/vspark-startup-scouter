@@ -49,7 +49,7 @@ TEMPLATE_PATH = Path(__file__).parent / "assets" / "ventures_tracker_template.xl
 # ---------- Header ----------
 
 st.title("V-Spark Startup Scouter")
-st.caption("Vedanta Spark engagement · Accenture Strategy IMU")
+st.caption("Evaluates startups for Vedanta BUs · returns assessment + briefing report")
 
 # ---------- Validate API key early ----------
 
